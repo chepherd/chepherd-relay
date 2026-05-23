@@ -1,0 +1,8 @@
+chepherd-relay
+*.test
+*.out
+dist/
+.DS_Store
+.idea/
+.vscode/
+*.swp
