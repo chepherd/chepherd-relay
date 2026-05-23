@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/chepherd/chepherd-relay/internal/auth"
+	"github.com/chepherd/chepherd-relay/internal/obs"
 	"github.com/chepherd/chepherd-relay/internal/registry"
 )
 
@@ -35,6 +36,13 @@ func main() {
 	audience := flag.String("audience", "chepherd-rc",
 		"expected JWT audience")
 	flag.Parse()
+
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer bootCancel()
+	obsShutdown, err := obs.Init(bootCtx, obs.FromEnv("chepherd-relay", Version))
+	if err != nil {
+		log.Fatalf("obs init: %v", err)
+	}
 
 	srv := newRelay()
 
@@ -72,7 +80,7 @@ func main() {
 
 	httpSrv := &http.Server{
 		Addr:              *addr,
-		Handler:           mux,
+		Handler:           obs.Middleware(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -91,6 +99,9 @@ func main() {
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutCancel()
 	_ = httpSrv.Shutdown(shutCtx)
+	if obsShutdown != nil {
+		_ = obsShutdown(shutCtx)
+	}
 }
 
 // ─── relay core ─────────────────────────────────────────────────────────
