@@ -349,11 +349,20 @@ func (r *relay) health(w http.ResponseWriter, req *http.Request) {
 
 func (r *relay) stats(w http.ResponseWriter, req *http.Request) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	pendingOffers := len(r.pendingOffers)
+	pendingAnswers := len(r.pendingAnswers)
+	candidateQueues := len(r.candidateQueues)
+	r.mu.Unlock()
+	wsStats := r.wsHub.Stats()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"uptime_sec":              int(time.Since(r.startedAt).Seconds()),
-		"pending_offer_queues":    len(r.pendingOffers),
-		"pending_answer_channels": len(r.pendingAnswers),
+		"pending_offer_queues":    pendingOffers,
+		"pending_answer_channels": pendingAnswers,
+		"candidate_queues":        candidateQueues,
+		"ws_open_rooms":           wsStats.OpenRooms,
+		"ws_rooms_with_daemon":    wsStats.RoomsWithDaemon,
+		"ws_open_client_ws":       wsStats.OpenClientWs,
+		"version":                 Version,
 	})
 }
 
