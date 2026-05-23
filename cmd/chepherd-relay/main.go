@@ -26,7 +26,7 @@ import (
 )
 
 // Version is overridden at build time via -ldflags.
-var Version = "0.2.0-rc1"
+var Version = "0.2.0-rc3"
 
 func main() {
 	addr := flag.String("addr", ":9889",
