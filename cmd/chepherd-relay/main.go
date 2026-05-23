@@ -17,6 +17,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/chepherd/chepherd-relay/internal/auth"
 )
 
 // Version is overridden at build time via -ldflags.
@@ -25,19 +27,45 @@ var Version = "0.0.1-dev"
 func main() {
 	addr := flag.String("addr", ":9889",
 		"HTTP listen address (CAO convention port 9889)")
+	jwksURL := flag.String("jwks", os.Getenv("CHEPHERD_RELAY_JWKS"),
+		"identity-svc JWKS endpoint (also: CHEPHERD_RELAY_JWKS env)")
+	issuer := flag.String("issuer", os.Getenv("CHEPHERD_RELAY_ISSUER"),
+		"expected JWT issuer (also: CHEPHERD_RELAY_ISSUER env)")
+	audience := flag.String("audience", "chepherd-rc",
+		"expected JWT audience")
 	flag.Parse()
 
 	srv := newRelay()
+
+	// Auth verifier — required for signaling endpoints; bypassed for health.
+	var verifier *auth.Verifier
+	if *jwksURL != "" {
+		verifier = auth.New(*jwksURL, *issuer, *audience)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", srv.health)
 	mux.HandleFunc("/v1/stats", srv.stats)
-	mux.HandleFunc("/v1/signaling/initiate", srv.signalingInitiate)
-	mux.HandleFunc("/v1/signaling/poll", srv.signalingPoll)
-	mux.HandleFunc("/v1/signaling/answer", srv.signalingAnswer)
+
+	// Protected endpoints — wrap with auth middleware when verifier is set.
+	protect := func(h http.HandlerFunc) http.HandlerFunc {
+		if verifier == nil {
+			// Dev mode without JWKS — allow all (logs a warning).
+			return h
+		}
+		wrapped := verifier.Middleware(http.HandlerFunc(h))
+		return wrapped.ServeHTTP
+	}
+	mux.HandleFunc("/v1/signaling/initiate", protect(srv.signalingInitiate))
+	mux.HandleFunc("/v1/signaling/poll", protect(srv.signalingPoll))
+	mux.HandleFunc("/v1/signaling/answer", protect(srv.signalingAnswer))
 	// Future:
-	//   /v1/auth/*       OAuth2 PKCE passthrough to identity-svc
 	//   /v1/ws           WebSocket relay fallback (opt-in)
 	//   /v1/push/*       APNs / FCM proxy
+
+	if verifier == nil {
+		log.Println("WARNING: --jwks not set; auth bypassed (dev mode only).")
+	}
 
 	httpSrv := &http.Server{
 		Addr:              *addr,
