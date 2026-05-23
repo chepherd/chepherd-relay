@@ -1,4 +1,5 @@
-chepherd-relay
+# Compiled binary at repo root (NOT the cmd/chepherd-relay/ source dir).
+/chepherd-relay
 *.test
 *.out
 dist/
