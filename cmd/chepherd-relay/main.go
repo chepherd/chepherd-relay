@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/chepherd/chepherd-relay/internal/auth"
+	"github.com/chepherd/chepherd-relay/internal/registry"
 )
 
 // Version is overridden at build time via -ldflags.
@@ -59,6 +60,8 @@ func main() {
 	mux.HandleFunc("/v1/signaling/initiate", protect(srv.signalingInitiate))
 	mux.HandleFunc("/v1/signaling/poll", protect(srv.signalingPoll))
 	mux.HandleFunc("/v1/signaling/answer", protect(srv.signalingAnswer))
+	mux.HandleFunc("/v1/register", protect(srv.registerBastion))
+	mux.HandleFunc("/v1/bastions", protect(srv.listMyBastions))
 	// Future:
 	//   /v1/ws           WebSocket relay fallback (opt-in)
 	//   /v1/push/*       APNs / FCM proxy
@@ -100,6 +103,8 @@ type relay struct {
 	pendingAnswers map[string]chan *signalEnvelope
 	// startedAt
 	startedAt time.Time
+	// registry tracks which bastions are registered + their daemon tokens
+	registry registry.Registry
 }
 
 func newRelay() *relay {
@@ -107,7 +112,68 @@ func newRelay() *relay {
 		pendingOffers:  map[string]chan *signalEnvelope{},
 		pendingAnswers: map[string]chan *signalEnvelope{},
 		startedAt:      time.Now().UTC(),
+		registry:       registry.NewMemory(),
 	}
+}
+
+// registerBastion mints a fresh daemon token for a bastion.
+// POST /v1/register
+// Authenticated (user token); body: {id, capabilities, chepherd_version}
+// Response: {daemon_token, bastion: {...}}
+func (r *relay) registerBastion(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	claims := auth.ClaimsFromContext(req.Context())
+	if claims == nil {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		ID              string   `json:"id"`
+		Capabilities    []string `json:"capabilities"`
+		ChepherdVersion string   `json:"chepherd_version"`
+		Hostname        string   `json:"hostname"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if body.ID == "" {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+	tok, err := r.registry.Register(req.Context(), registry.Bastion{
+		ID:              body.ID,
+		UserID:          claims.UserID,
+		ChepherdVersion: body.ChepherdVersion,
+		Capabilities:    body.Capabilities,
+		Hostname:        body.Hostname,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	b, _ := r.registry.Get(req.Context(), body.ID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"daemon_token": tok,
+		"bastion":      b,
+	})
+}
+
+// listMyBastions returns the bastions owned by the authenticated user.
+// GET /v1/bastions
+func (r *relay) listMyBastions(w http.ResponseWriter, req *http.Request) {
+	claims := auth.ClaimsFromContext(req.Context())
+	if claims == nil {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return
+	}
+	bastions, _ := r.registry.ListByUser(req.Context(), claims.UserID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"bastions": bastions,
+	})
 }
 
 // signalEnvelope is the relay's internal pass-through shape. It carries the
