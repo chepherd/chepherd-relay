@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	firebase.google.com/go/v4 v4.20.0
+	github.com/coder/websocket v1.8.14
 	github.com/getsentry/sentry-go v0.46.2
 	github.com/sideshow/apns2 v0.25.0
 	go.opentelemetry.io/otel v1.43.0

@@ -22,6 +22,7 @@ import (
 	"github.com/chepherd/chepherd-relay/internal/obs"
 	"github.com/chepherd/chepherd-relay/internal/push"
 	"github.com/chepherd/chepherd-relay/internal/registry"
+	"github.com/chepherd/chepherd-relay/internal/wsrelay"
 )
 
 // Version is overridden at build time via -ldflags.
@@ -79,8 +80,11 @@ func main() {
 	mux.HandleFunc("/v1/bastions", protect(srv.listMyBastions))
 	mux.HandleFunc("/v1/push/register", protect(srv.pushRegister))
 	mux.HandleFunc("/v1/push/send", protect(srv.pushSend))
-	// Future:
-	//   /v1/ws           WebSocket relay fallback (opt-in)
+	// Relayed-mode data plane — clients + daemons WebSocket here when
+	// WebRTC isn't an option (symmetric NAT, corporate proxies). The
+	// relay forwards every frame VERBATIM — privacy trade-off is
+	// explicit per protocol §1.
+	mux.HandleFunc("/v1/signaling/ws", protect(srv.wsHub.HandleHTTP))
 
 	if verifier == nil {
 		log.Println("WARNING: --jwks not set; auth bypassed (dev mode only).")
@@ -130,6 +134,8 @@ type relay struct {
 	pushTokens push.TokenRegistry
 	// pushDispatcher routes a Notification to the right backend
 	pushDispatcher push.Dispatcher
+	// wsHub multiplexes relayed-mode WS clients ↔ daemons by bastion_id
+	wsHub *wsrelay.Hub
 }
 
 func newRelay() *relay {
@@ -141,6 +147,7 @@ func newRelay() *relay {
 		registry:        registry.NewMemory(),
 		pushTokens:      push.NewMemory(),
 		pushDispatcher:  push.FromEnv(context.Background()),
+		wsHub:           wsrelay.New(),
 	}
 }
 
