@@ -20,6 +20,7 @@ import (
 
 	"github.com/chepherd/chepherd-relay/internal/auth"
 	"github.com/chepherd/chepherd-relay/internal/obs"
+	"github.com/chepherd/chepherd-relay/internal/push"
 	"github.com/chepherd/chepherd-relay/internal/registry"
 )
 
@@ -70,9 +71,10 @@ func main() {
 	mux.HandleFunc("/v1/signaling/answer", protect(srv.signalingAnswer))
 	mux.HandleFunc("/v1/register", protect(srv.registerBastion))
 	mux.HandleFunc("/v1/bastions", protect(srv.listMyBastions))
+	mux.HandleFunc("/v1/push/register", protect(srv.pushRegister))
+	mux.HandleFunc("/v1/push/send", protect(srv.pushSend))
 	// Future:
 	//   /v1/ws           WebSocket relay fallback (opt-in)
-	//   /v1/push/*       APNs / FCM proxy
 
 	if verifier == nil {
 		log.Println("WARNING: --jwks not set; auth bypassed (dev mode only).")
@@ -116,6 +118,10 @@ type relay struct {
 	startedAt time.Time
 	// registry tracks which bastions are registered + their daemon tokens
 	registry registry.Registry
+	// pushTokens tracks per-user device tokens for APNs/FCM dispatch
+	pushTokens push.TokenRegistry
+	// pushDispatcher routes a Notification to the right backend
+	pushDispatcher push.Dispatcher
 }
 
 func newRelay() *relay {
@@ -124,7 +130,129 @@ func newRelay() *relay {
 		pendingAnswers: map[string]chan *signalEnvelope{},
 		startedAt:      time.Now().UTC(),
 		registry:       registry.NewMemory(),
+		pushTokens:     push.NewMemory(),
+		pushDispatcher: push.FromEnv(context.Background()),
 	}
+}
+
+// pushRegister upserts a device push token for the authenticated user.
+// POST /v1/push/register
+// Body: {device_id, platform, value, bundle_id?}
+func (r *relay) pushRegister(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	claims := auth.ClaimsFromContext(req.Context())
+	if claims == nil {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		DeviceID string `json:"device_id"`
+		Platform string `json:"platform"` // "ios" | "android" | "webpush"
+		Value    string `json:"value"`
+		BundleID string `json:"bundle_id"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if body.DeviceID == "" || body.Value == "" {
+		http.Error(w, "device_id and value required", http.StatusBadRequest)
+		return
+	}
+	var plat push.Platform
+	switch body.Platform {
+	case "ios":
+		plat = push.PlatformiOS
+	case "android":
+		plat = push.PlatformAndroid
+	case "webpush":
+		plat = push.PlatformWebPush
+	default:
+		http.Error(w, "invalid platform", http.StatusBadRequest)
+		return
+	}
+	if err := r.pushTokens.Upsert(req.Context(), push.Registration{
+		UserID:   claims.UserID,
+		DeviceID: body.DeviceID,
+		Token: push.Token{
+			Platform: plat,
+			Value:    body.Value,
+			BundleID: body.BundleID,
+		},
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// pushSend dispatches a notification to all the caller-user's devices.
+// POST /v1/push/send
+// Body: {title, body, sound?, priority?, session_uuid, collapse_key?, ttl_seconds?}
+// Caller is the daemon (authenticated via its daemon token) — its claims
+// carry the operator user_id, so we send to THAT user's devices.
+func (r *relay) pushSend(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	claims := auth.ClaimsFromContext(req.Context())
+	if claims == nil {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return
+	}
+	var body struct {
+		Title       string `json:"title"`
+		Body        string `json:"body"`
+		Sound       string `json:"sound"`
+		Priority    string `json:"priority"` // "normal" | "high"
+		SessionUUID string `json:"session_uuid"`
+		CollapseKey string `json:"collapse_key"`
+		TTLSeconds  int    `json:"ttl_seconds"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	regs, err := r.pushTokens.ListByUser(req.Context(), claims.UserID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var prio push.Priority
+	if body.Priority == "high" {
+		prio = push.PriorityHigh
+	}
+	notif := push.Notification{
+		Title:       body.Title,
+		Body:        body.Body,
+		Sound:       body.Sound,
+		Priority:    prio,
+		SessionUUID: body.SessionUUID,
+		CollapseKey: body.CollapseKey,
+		TTL:         time.Duration(body.TTLSeconds) * time.Second,
+	}
+	var sent, failed int
+	for _, reg := range regs {
+		if err := r.pushDispatcher.Send(req.Context(), reg.Token, notif); err != nil {
+			failed++
+			_ = r.pushTokens.MarkFailure(req.Context(), reg.DeviceID)
+			obs.CaptureError(err, map[string]string{
+				"device_id": reg.DeviceID,
+				"platform":  fmt.Sprintf("%v", reg.Token.Platform),
+			})
+			continue
+		}
+		sent++
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"devices_attempted": len(regs),
+		"devices_sent":      sent,
+		"devices_failed":    failed,
+	})
 }
 
 // registerBastion mints a fresh daemon token for a bastion.
