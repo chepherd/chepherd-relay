@@ -91,6 +91,52 @@ func TestWSRelay_DaemonBroadcastsToAllClients(t *testing.T) {
 	}
 }
 
+func TestWSRelay_AcceptsSubprotocolAuth(t *testing.T) {
+	hub := New()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/signaling/ws", hub.HandleHTTP)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	// Browser-style: NO query params, all credentials in the subprotocol.
+	u := strings.Replace(ts.URL, "http://", "ws://", 1) + "/v1/signaling/ws"
+	browserSub := "chepherd-rc-v1.b3.eyJhbGciOiJSUzI1NiJ9.fake-jwt"
+	client, _, err := websocket.Dial(context.Background(), u, &websocket.DialOptions{
+		Subprotocols: []string{browserSub},
+	})
+	if err != nil {
+		t.Fatalf("browser dial: %v", err)
+	}
+	defer client.Close(websocket.StatusNormalClosure, "")
+
+	// Verify the relay echoed back the EXACT subprotocol so the
+	// browser would accept the upgrade.
+	if got := client.Subprotocol(); got != browserSub {
+		t.Errorf("subprotocol mismatch: got %q want %q", got, browserSub)
+	}
+
+	// Connect a daemon via classic query params + role to the same bastion.
+	daemon := dialWS(t, ts.URL, "daemon", "b3")
+	defer daemon.Close(websocket.StatusNormalClosure, "")
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Client → daemon proves the room was joined via the browser path.
+	want := `{"type":"ping","seq":1}`
+	if err := client.Write(context.Background(), websocket.MessageText, []byte(want)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, got, err := daemon.Read(ctx)
+	if err != nil {
+		t.Fatalf("daemon read: %v", err)
+	}
+	if string(got) != want {
+		t.Errorf("daemon got %q, want %q", got, want)
+	}
+}
+
 func TestWSRelay_RejectsBadParams(t *testing.T) {
 	hub := New()
 	mux := http.NewServeMux()
