@@ -85,6 +85,13 @@ func ClaimsFromContext(ctx context.Context) *Claims {
 	return c
 }
 
+// WithClaims stashes a Claims pointer on the request context. Normally the
+// Verifier.Middleware does this; exposed here so integration tests can
+// construct an authenticated context without minting a real JWT.
+func WithClaims(ctx context.Context, c *Claims) context.Context {
+	return context.WithValue(ctx, claimsKey, c)
+}
+
 // ─── verifier ──────────────────────────────────────────────────────────
 
 // Verifier validates JWT tokens issued by identity-svc. Caches JWKS keys
