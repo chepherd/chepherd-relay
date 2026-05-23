@@ -69,6 +69,12 @@ func main() {
 	mux.HandleFunc("/v1/signaling/initiate", protect(srv.signalingInitiate))
 	mux.HandleFunc("/v1/signaling/poll", protect(srv.signalingPoll))
 	mux.HandleFunc("/v1/signaling/answer", protect(srv.signalingAnswer))
+	// REST-style aliases used by the modern chepherd-rc-web + iOS + Android
+	// clients (trickled-ICE friendly). The initiate/poll/answer trio is
+	// kept around for backward compatibility with older daemons.
+	mux.HandleFunc("/v1/signaling/offer", protect(srv.signalingOffer))
+	mux.HandleFunc("/v1/signaling/candidate", protect(srv.signalingPostCandidate))
+	mux.HandleFunc("/v1/signaling/candidates", protect(srv.signalingPollCandidates))
 	mux.HandleFunc("/v1/register", protect(srv.registerBastion))
 	mux.HandleFunc("/v1/bastions", protect(srv.listMyBastions))
 	mux.HandleFunc("/v1/push/register", protect(srv.pushRegister))
@@ -114,6 +120,8 @@ type relay struct {
 	pendingOffers map[string]chan *signalEnvelope
 	// pendingAnswers: client_id → waiting answer from bastion
 	pendingAnswers map[string]chan *signalEnvelope
+	// candidateQueues: peer_id → trickled-ICE candidate fan-in queue
+	candidateQueues map[string]chan json.RawMessage
 	// startedAt
 	startedAt time.Time
 	// registry tracks which bastions are registered + their daemon tokens
@@ -126,12 +134,13 @@ type relay struct {
 
 func newRelay() *relay {
 	return &relay{
-		pendingOffers:  map[string]chan *signalEnvelope{},
-		pendingAnswers: map[string]chan *signalEnvelope{},
-		startedAt:      time.Now().UTC(),
-		registry:       registry.NewMemory(),
-		pushTokens:     push.NewMemory(),
-		pushDispatcher: push.FromEnv(context.Background()),
+		pendingOffers:   map[string]chan *signalEnvelope{},
+		pendingAnswers:  map[string]chan *signalEnvelope{},
+		candidateQueues: map[string]chan json.RawMessage{},
+		startedAt:       time.Now().UTC(),
+		registry:        registry.NewMemory(),
+		pushTokens:      push.NewMemory(),
+		pushDispatcher:  push.FromEnv(context.Background()),
 	}
 }
 
@@ -420,6 +429,148 @@ func (r *relay) signalingPoll(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	case <-req.Context().Done():
 	}
+}
+
+// signalingOffer is the REST-style entry used by the modern clients.
+// Body: {bastion_id, offer: <RTCSessionDescriptionInit>}.
+// Response: {answer: <RTCSessionDescriptionInit>}.
+// Internally wraps the existing initiate-poll-answer rendezvous so we
+// don't duplicate logic.
+func (r *relay) signalingOffer(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		BastionID string          `json:"bastion_id"`
+		Offer     json.RawMessage `json:"offer"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if body.BastionID == "" {
+		http.Error(w, "bastion_id required", http.StatusBadRequest)
+		return
+	}
+
+	clientID := genClientID()
+	answerCh := make(chan *signalEnvelope, 1)
+	r.mu.Lock()
+	r.pendingAnswers[clientID] = answerCh
+	queue, ok := r.pendingOffers[body.BastionID]
+	if !ok {
+		queue = make(chan *signalEnvelope, 16)
+		r.pendingOffers[body.BastionID] = queue
+	}
+	r.mu.Unlock()
+
+	select {
+	case queue <- &signalEnvelope{Peer: clientID, SDP: body.Offer}:
+	case <-time.After(2 * time.Second):
+		http.Error(w, "bastion offer queue full", http.StatusServiceUnavailable)
+		return
+	}
+
+	select {
+	case answer := <-answerCh:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"answer":    json.RawMessage(answer.SDP),
+			"client_id": clientID,
+		})
+	case <-time.After(60 * time.Second):
+		http.Error(w, "bastion did not answer within 60s", http.StatusGatewayTimeout)
+	case <-req.Context().Done():
+	}
+
+	r.mu.Lock()
+	delete(r.pendingAnswers, clientID)
+	r.mu.Unlock()
+}
+
+// signalingPostCandidate accepts a trickled ICE candidate from either
+// the client (peer=bastion_id) or the bastion (peer=client_id).
+// Body: {bastion_id, candidate: <RTCIceCandidateInit>}.
+// The candidate is fanned into a per-peer queue; the OTHER side's
+// candidates endpoint long-polls that queue.
+func (r *relay) signalingPostCandidate(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "POST" {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		BastionID string          `json:"bastion_id"`
+		Candidate json.RawMessage `json:"candidate"`
+	}
+	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if body.BastionID == "" || len(body.Candidate) == 0 {
+		http.Error(w, "bastion_id and candidate required", http.StatusBadRequest)
+		return
+	}
+	r.mu.Lock()
+	q := r.candidateQueueLocked(body.BastionID)
+	r.mu.Unlock()
+	select {
+	case q <- body.Candidate:
+		w.WriteHeader(http.StatusNoContent)
+	case <-time.After(1 * time.Second):
+		http.Error(w, "candidate queue full", http.StatusServiceUnavailable)
+	}
+}
+
+// signalingPollCandidates long-polls (up to 25 sec) for trickled remote
+// candidates addressed to the requesting peer. The peer is identified
+// by ?bastion_id= (the OTHER side of the rendezvous).
+// Response: {candidates: [...], cursor: "<opaque>"}.
+func (r *relay) signalingPollCandidates(w http.ResponseWriter, req *http.Request) {
+	bid := req.URL.Query().Get("bastion_id")
+	if bid == "" {
+		http.Error(w, "bastion_id required", http.StatusBadRequest)
+		return
+	}
+	r.mu.Lock()
+	q := r.candidateQueueLocked(bid)
+	r.mu.Unlock()
+
+	var out []json.RawMessage
+	select {
+	case c := <-q:
+		out = append(out, c)
+		// Drain whatever else is immediately available without blocking.
+		for {
+			select {
+			case extra := <-q:
+				out = append(out, extra)
+			default:
+				goto done
+			}
+		}
+	case <-time.After(25 * time.Second):
+	case <-req.Context().Done():
+		return
+	}
+done:
+	writeJSON(w, http.StatusOK, map[string]any{
+		"candidates": out,
+		"cursor":     fmt.Sprintf("ts-%d", time.Now().UnixNano()),
+	})
+}
+
+// candidateQueueLocked returns or lazily creates the trickled-ICE queue
+// for a peer. Caller must hold r.mu.
+func (r *relay) candidateQueueLocked(peer string) chan json.RawMessage {
+	if r.candidateQueues == nil {
+		r.candidateQueues = map[string]chan json.RawMessage{}
+	}
+	q, ok := r.candidateQueues[peer]
+	if !ok {
+		q = make(chan json.RawMessage, 32)
+		r.candidateQueues[peer] = q
+	}
+	return q
 }
 
 // signalingAnswer: bastion posts its SDP answer + ICE back to the relay,
