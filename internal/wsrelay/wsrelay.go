@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/coder/websocket"
@@ -63,10 +64,49 @@ type conn struct {
 // HandleHTTP is the http.Handler entry point — wire as:
 //
 //	mux.HandleFunc("/v1/signaling/ws", hub.HandleHTTP)
+//
+// Auth flavors supported (browsers cannot set Authorization on WS):
+//   - Authorization: Bearer <jwt>  (daemons, Go clients)
+//   - Sec-WebSocket-Protocol: chepherd-rc-v1.<bastion_id>.<jwt>
+//     (browsers + native mobile clients) — when this form is sent,
+//     bastion_id is parsed from the subprotocol and overrides the
+//     query-string fallback. Token validation is the caller's
+//     responsibility (the relay's auth.Middleware runs before this
+//     handler when wrapped, or callers may bypass middleware on this
+//     route specifically to use the subprotocol-encoded credentials).
 func (h *Hub) HandleHTTP(w http.ResponseWriter, req *http.Request) {
 	role := req.URL.Query().Get("role")
 	bastionID := req.URL.Query().Get("bastion_id")
 	clientID := req.URL.Query().Get("client_id") // optional, generated if empty
+
+	// Try parsing browser-style subprotocol-embedded credentials.
+	// The browser sends "chepherd-rc-v1.<bastion>.<token>"; the relay
+	// negotiates back the SAME string so the browser accepts the upgrade.
+	var negotiated string
+	for _, p := range parseSecWSProtocol(req) {
+		if strings.HasPrefix(p, "chepherd-rc-v1.") {
+			rest := strings.TrimPrefix(p, "chepherd-rc-v1.")
+			parts := strings.SplitN(rest, ".", 2)
+			if len(parts) == 2 {
+				// browser-encoded {bastion_id}.{token}
+				if bastionID == "" {
+					bastionID = parts[0]
+				}
+				// Note: token validation here belongs to the auth layer —
+				// the wsrelay treats both URL-query and subprotocol-encoded
+				// credentials as opaque; the wrapping middleware (if any)
+				// has already authorised this request.
+				if role == "" {
+					role = "client" // browsers default to client
+				}
+				negotiated = p
+			}
+		}
+		if p == "chepherd-rc-v1" && negotiated == "" {
+			negotiated = p
+		}
+	}
+
 	if role != "client" && role != "daemon" {
 		http.Error(w, "role required (client|daemon)", http.StatusBadRequest)
 		return
@@ -75,8 +115,15 @@ func (h *Hub) HandleHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "bastion_id required", http.StatusBadRequest)
 		return
 	}
+
+	subs := []string{"chepherd-rc-v1"}
+	if negotiated != "" && negotiated != "chepherd-rc-v1" {
+		// Accept the exact subprotocol the browser sent.
+		subs = []string{negotiated}
+	}
 	ws, err := websocket.Accept(w, req, &websocket.AcceptOptions{
-		Subprotocols: []string{"chepherd-rc-v1"},
+		Subprotocols:       subs,
+		InsecureSkipVerify: true, // Origin checked by the outer auth layer.
 	})
 	if err != nil {
 		return
@@ -208,3 +255,18 @@ type Stats struct {
 var (
 	ErrUnknownRole = errors.New("wsrelay: unknown role")
 )
+
+// parseSecWSProtocol splits the Sec-WebSocket-Protocol header into the
+// list of subprotocols the client offered. Browsers send a single header
+// with comma-separated values; tests may send one value per header.
+func parseSecWSProtocol(req *http.Request) []string {
+	var out []string
+	for _, h := range req.Header.Values("Sec-WebSocket-Protocol") {
+		for _, p := range strings.Split(h, ",") {
+			if s := strings.TrimSpace(p); s != "" {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
